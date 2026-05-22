@@ -39,7 +39,7 @@ pub fn responses_to_chat_completions(body: Value) -> Result<Value, ProxyError> {
     let preserve_reasoning_content = body
         .get("model")
         .and_then(|v| v.as_str())
-        .is_some_and(super::codex::is_deepseek_model);
+        .is_some_and(|m| super::codex::should_preserve_reasoning(m));
     if let Some(instructions) = body.get("instructions") {
         let instructions = instruction_text(instructions);
         if !instructions.is_empty() {

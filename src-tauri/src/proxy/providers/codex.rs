@@ -19,15 +19,25 @@ static CODEX_CLIENT_REGEX: LazyLock<Regex> =
 /// Codex 适配器
 pub struct CodexAdapter;
 
-/// Whether this Codex request should be bridged from Responses to upstream
-/// Chat Completions.
-///
-/// 这里只看最终模型标识里的关键词，不绑定具体供应商或某个固定版本号。
-pub fn is_deepseek_model(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("deepseek")
-}
+/// 已知仅支持 Chat Completions（不支持 Responses API）的模型族。
+/// 当中转站 provider 的 Codex TOML config 无法明确判断时，
+/// 按模型名 fallback 决定是否桥接到 Chat。
+static KNOWN_CHAT_ONLY_MODEL_FAMILIES: &[&str] = &["deepseek", "kimi", "moonshot"];
 
-pub fn should_convert_codex_responses_to_chat(endpoint: &str, model: Option<&str>) -> bool {
+/// 已知需要在上游 Chat 消息中保留 `reasoning_content` 的模型族。
+/// DeepSeek / Kimi / Moonshot 等 reasoning 模型的推理文本
+/// 在 Responses→Chat 桥接时必须通过 `reasoning_content` 字段保留。
+static REASONING_MODEL_FAMILIES: &[&str] = &["deepseek", "kimi", "moonshot"];
+
+/// 判断是否应将 Codex Responses API 请求桥接到上游 Chat Completions。
+///
+/// 根据请求中的模型名判断：已知仅支持 Chat Completions 的模型族
+/// 需要 Responses→Chat 桥接，其余模型不走桥接。
+pub fn should_convert_codex_responses_to_chat(
+    _provider: &Provider,
+    endpoint: &str,
+    model: Option<&str>,
+) -> bool {
     let path = endpoint
         .split_once('?')
         .map_or(endpoint, |(path, _query)| path);
@@ -35,7 +45,22 @@ pub fn should_convert_codex_responses_to_chat(endpoint: &str, model: Option<&str
     matches!(
         path,
         "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
-    ) && model.is_some_and(is_deepseek_model)
+    ) && model.is_some_and(is_known_chat_only_model)
+}
+
+/// 判断模型在上游 Chat 桥接时是否需要保留 `reasoning_content`。
+pub fn should_preserve_reasoning(model: &str) -> bool {
+    let model_lower = model.to_ascii_lowercase();
+    REASONING_MODEL_FAMILIES
+        .iter()
+        .any(|family| model_lower.contains(family))
+}
+
+fn is_known_chat_only_model(model: &str) -> bool {
+    let model_lower = model.to_ascii_lowercase();
+    KNOWN_CHAT_ONLY_MODEL_FAMILIES
+        .iter()
+        .any(|family| model_lower.contains(family))
 }
 
 impl CodexAdapter {
@@ -327,26 +352,77 @@ mod tests {
     }
 
     #[test]
-    fn test_deepseek_model_forces_codex_chat_bridge_without_wire_api() {
+    fn test_relay_provider_falls_back_to_model_name() {
+        // 中转站 provider：无 TOML config 的 wire_api
+        let provider = create_provider(json!({
+            "base_url": "https://my-relay.com/v1"
+        }));
+
+        // Chat-only 模型 → fallback 到模型名判断，需要转换
         assert!(should_convert_codex_responses_to_chat(
+            &provider,
             "/v1/responses",
-            Some("deepseek-chat")
+            Some("deepseek-v4-pro"),
         ));
         assert!(should_convert_codex_responses_to_chat(
+            &provider,
             "/v1/responses",
-            Some("deepseek-reasoner")
+            Some("kimi-k2"),
         ));
-        assert!(should_convert_codex_responses_to_chat(
+
+        // 非 Chat-only 模型 → 不转换
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
             "/v1/responses",
-            Some("deepseek-v4-pro")
-        ));
-        assert!(should_convert_codex_responses_to_chat(
-            "/v1/responses/compact?stream=true",
-            Some("vendor/deepseek-r1")
+            Some("gpt-5.4"),
         ));
         assert!(!should_convert_codex_responses_to_chat(
+            &provider,
             "/v1/responses",
-            Some("gpt-5.4")
+            Some("claude-sonnet-4-5"),
         ));
+
+        // 非 Responses 端点 → 不转换
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
+            "/chat/completions",
+            Some("deepseek-v4-pro"),
+        ));
+    }
+
+    #[test]
+    fn test_non_chat_only_models_do_not_bridge() {
+        // 非 Chat-only 模型（gpt、claude）不应触发桥接，即使 provider 有 TOML config
+        let provider = create_provider(json!({
+            "config": r#"
+model_provider = "openai"
+model = "gpt-5.4"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+"#
+        }));
+
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
+            "/v1/responses",
+            Some("gpt-5.4"),
+        ));
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
+            "/v1/responses",
+            Some("claude-sonnet-4-5"),
+        ));
+    }
+
+    #[test]
+    fn test_should_preserve_reasoning() {
+        assert!(should_preserve_reasoning("deepseek-v4-pro"));
+        assert!(should_preserve_reasoning("deepseek-chat"));
+        assert!(should_preserve_reasoning("kimi-k2"));
+        assert!(should_preserve_reasoning("moonshot-v1"));
+        assert!(!should_preserve_reasoning("gpt-5.4"));
+        assert!(!should_preserve_reasoning("claude-sonnet-4-5"));
     }
 }

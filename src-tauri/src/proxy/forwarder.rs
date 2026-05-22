@@ -1114,7 +1114,11 @@ impl RequestForwarder {
         };
         let mapped_model = mapped_body.get("model").and_then(|v| v.as_str());
         let codex_responses_to_chat = matches!(app_type, AppType::Codex)
-            && super::providers::should_convert_codex_responses_to_chat(endpoint, mapped_model);
+            && super::providers::should_convert_codex_responses_to_chat(
+                provider,
+                endpoint,
+                mapped_model,
+            );
         let (effective_endpoint, passthrough_query) = if codex_responses_to_chat {
             rewrite_codex_responses_endpoint_to_chat(endpoint)
         } else if needs_transform && adapter.name() == "Claude" {
