@@ -6,6 +6,7 @@
 
 use crate::proxy::{error::ProxyError, json_canonical::canonical_json_string};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "frequency_penalty",
@@ -35,6 +36,10 @@ pub fn responses_to_chat_completions(body: Value) -> Result<Value, ProxyError> {
     }
 
     let mut messages = Vec::new();
+    let preserve_reasoning_content = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(super::codex::is_deepseek_model);
     if let Some(instructions) = body.get("instructions") {
         let instructions = instruction_text(instructions);
         if !instructions.is_empty() {
@@ -46,8 +51,13 @@ pub fn responses_to_chat_completions(body: Value) -> Result<Value, ProxyError> {
     }
 
     if let Some(input) = body.get("input") {
-        append_responses_input_as_chat_messages(input, &mut messages)?;
+        append_responses_input_as_chat_messages(
+            input,
+            &mut messages,
+            preserve_reasoning_content,
+        )?;
     }
+    sanitize_orphan_tool_call_messages(&mut messages);
     result["messages"] = json!(messages);
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -120,8 +130,11 @@ fn instruction_text(value: &Value) -> String {
 fn append_responses_input_as_chat_messages(
     input: &Value,
     messages: &mut Vec<Value>,
+    preserve_reasoning_content: bool,
 ) -> Result<(), ProxyError> {
     let mut pending_tool_calls = Vec::new();
+    let mut pending_reasoning = None;
+    let mut pending_assistant_message = None;
 
     match input {
         Value::String(text) => {
@@ -132,16 +145,36 @@ fn append_responses_input_as_chat_messages(
         }
         Value::Array(items) => {
             for item in items {
-                append_responses_item_as_chat_message(item, messages, &mut pending_tool_calls)?;
+                append_responses_item_as_chat_message(
+                    item,
+                    messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                    &mut pending_assistant_message,
+                    preserve_reasoning_content,
+                )?;
             }
         }
         Value::Object(_) => {
-            append_responses_item_as_chat_message(input, messages, &mut pending_tool_calls)?;
+            append_responses_item_as_chat_message(
+                input,
+                messages,
+                &mut pending_tool_calls,
+                &mut pending_reasoning,
+                &mut pending_assistant_message,
+                preserve_reasoning_content,
+            )?;
         }
         _ => {}
     }
 
-    flush_pending_tool_calls(messages, &mut pending_tool_calls);
+    flush_pending_assistant_state(
+        messages,
+        &mut pending_tool_calls,
+        &mut pending_reasoning,
+        &mut pending_assistant_message,
+        preserve_reasoning_content,
+    );
     Ok(())
 }
 
@@ -149,6 +182,9 @@ fn append_responses_item_as_chat_message(
     item: &Value,
     messages: &mut Vec<Value>,
     pending_tool_calls: &mut Vec<Value>,
+    pending_reasoning: &mut Option<String>,
+    pending_assistant_message: &mut Option<Value>,
+    preserve_reasoning_content: bool,
 ) -> Result<(), ProxyError> {
     let item_type = item.get("type").and_then(|v| v.as_str());
     match item_type {
@@ -156,7 +192,13 @@ fn append_responses_item_as_chat_message(
             pending_tool_calls.push(responses_function_call_to_chat_tool_call(item));
         }
         Some("function_call_output") => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
+            flush_pending_assistant_state(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                pending_assistant_message,
+                preserve_reasoning_content,
+            );
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let output = match item.get("output") {
                 Some(Value::String(s)) => s.clone(),
@@ -170,18 +212,45 @@ fn append_responses_item_as_chat_message(
             }));
         }
         Some("reasoning") => {
-            // Reasoning items are Responses-specific context. Chat-only providers
-            // cannot consume encrypted reasoning state, so omit it.
+            if let Some(reasoning) = extract_responses_reasoning_text(item) {
+                merge_reasoning_text(pending_reasoning, &reasoning);
+            }
         }
         Some("message") | None => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
             if item.get("role").is_some() || item.get("content").is_some() {
-                messages.push(responses_message_item_to_chat_message(item));
+                let message = responses_message_item_to_chat_message(item);
+                if message.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                    if pending_assistant_message.is_some() || !pending_tool_calls.is_empty() {
+                        flush_pending_assistant_state(
+                            messages,
+                            pending_tool_calls,
+                            pending_reasoning,
+                            pending_assistant_message,
+                            preserve_reasoning_content,
+                        );
+                    }
+                    *pending_assistant_message = Some(message);
+                } else {
+                    flush_pending_assistant_state(
+                        messages,
+                        pending_tool_calls,
+                        pending_reasoning,
+                        pending_assistant_message,
+                        preserve_reasoning_content,
+                    );
+                    messages.push(message);
+                }
             }
         }
         _ => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
             if item.get("role").is_some() || item.get("content").is_some() {
+                flush_pending_assistant_state(
+                    messages,
+                    pending_tool_calls,
+                    pending_reasoning,
+                    pending_assistant_message,
+                    preserve_reasoning_content,
+                );
                 messages.push(responses_message_item_to_chat_message(item));
             }
         }
@@ -190,20 +259,199 @@ fn append_responses_item_as_chat_message(
     Ok(())
 }
 
-fn flush_pending_tool_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
-    if pending_tool_calls.is_empty() {
+fn flush_pending_assistant_state(
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &mut Vec<Value>,
+    pending_reasoning: &mut Option<String>,
+    pending_assistant_message: &mut Option<Value>,
+    preserve_reasoning_content: bool,
+) {
+    if pending_tool_calls.is_empty()
+        && pending_assistant_message.is_none()
+        && pending_reasoning.is_none()
+    {
         return;
     }
 
-    messages.push(json!({
-        "role": "assistant",
-        "content": null,
-        "tool_calls": std::mem::take(pending_tool_calls)
-    }));
+    let mut assistant_message = pending_assistant_message
+        .take()
+        .unwrap_or_else(|| json!({ "role": "assistant", "content": Value::Null }));
+
+    if !pending_tool_calls.is_empty() {
+        assistant_message["tool_calls"] = json!(std::mem::take(pending_tool_calls));
+    }
+
+    if preserve_reasoning_content {
+        if let Some(reasoning) = pending_reasoning.take().filter(|value| !value.is_empty()) {
+            assistant_message["reasoning_content"] = json!(reasoning);
+        }
+    } else {
+        pending_reasoning.take();
+    }
+
+    let content_is_empty = assistant_message
+        .get("content")
+        .is_none_or(|content| content.is_null());
+    let has_tool_calls = assistant_message
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tool_calls| !tool_calls.is_empty());
+    let has_reasoning = assistant_message
+        .get("reasoning_content")
+        .and_then(|value| value.as_str())
+        .is_some_and(|text| !text.is_empty());
+
+    if !content_is_empty || has_tool_calls || has_reasoning {
+        messages.push(assistant_message);
+    }
+}
+
+fn merge_reasoning_text(target: &mut Option<String>, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+
+    match target {
+        Some(existing) => existing.push_str(delta),
+        None => *target = Some(delta.to_string()),
+    }
+}
+
+fn extract_responses_reasoning_text(item: &Value) -> Option<String> {
+    if let Some(summary) = item.get("summary").and_then(|value| value.as_array()) {
+        let text = summary
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| part.get("summary").and_then(|value| value.as_str()))
+            })
+            .collect::<String>();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    item.get("text")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn sanitize_orphan_tool_call_messages(messages: &mut Vec<Value>) {
+    let mut sanitized = Vec::with_capacity(messages.len());
+    let mut index = 0;
+
+    while index < messages.len() {
+        let message = &messages[index];
+        let role = message.get("role").and_then(|value| value.as_str());
+
+        if role != Some("assistant") {
+            sanitized.push(message.clone());
+            index += 1;
+            continue;
+        }
+
+        let Some(tool_calls) = message.get("tool_calls").and_then(|value| value.as_array()) else {
+            sanitized.push(message.clone());
+            index += 1;
+            continue;
+        };
+
+        let expected_tool_call_ids: HashSet<String> = tool_calls
+            .iter()
+            .filter_map(|tool_call| {
+                tool_call
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })
+            .collect();
+
+        if expected_tool_call_ids.is_empty() {
+            let mut assistant = message.clone();
+            remove_tool_calls(&mut assistant);
+            if assistant_message_has_visible_payload(&assistant) {
+                sanitized.push(assistant);
+            }
+            index += 1;
+            continue;
+        }
+
+        let mut next_index = index + 1;
+        let mut following_tool_messages = Vec::new();
+        let mut matched_tool_call_ids = HashSet::new();
+
+        while next_index < messages.len()
+            && messages[next_index]
+                .get("role")
+                .and_then(|value| value.as_str())
+                == Some("tool")
+        {
+            let tool_message = messages[next_index].clone();
+            if let Some(tool_call_id) = tool_message
+                .get("tool_call_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+            {
+                matched_tool_call_ids.insert(tool_call_id.to_string());
+            }
+            following_tool_messages.push(tool_message);
+            next_index += 1;
+        }
+
+        if expected_tool_call_ids.is_subset(&matched_tool_call_ids) {
+            sanitized.push(message.clone());
+            sanitized.extend(following_tool_messages);
+        } else {
+            let mut assistant = message.clone();
+            remove_tool_calls(&mut assistant);
+            if assistant_message_has_visible_payload(&assistant) {
+                sanitized.push(assistant);
+            }
+        }
+
+        index = next_index;
+    }
+
+    *messages = sanitized;
+}
+
+fn remove_tool_calls(message: &mut Value) {
+    if let Some(obj) = message.as_object_mut() {
+        obj.remove("tool_calls");
+        obj.remove("function_call");
+    }
+}
+
+fn assistant_message_has_visible_payload(message: &Value) -> bool {
+    message
+        .get("content")
+        .is_some_and(|content| match content {
+            Value::Null => false,
+            Value::String(text) => !text.is_empty(),
+            Value::Array(parts) => !parts.is_empty(),
+            _ => true,
+        })
+        || message
+            .get("reasoning_content")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.is_empty())
+        || message
+            .get("reasoning")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.is_empty())
+        || message
+            .get("refusal")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.is_empty())
 }
 
 fn responses_message_item_to_chat_message(item: &Value) -> Value {
-    let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+    let role = normalize_responses_message_role(
+        item.get("role").and_then(|v| v.as_str()).unwrap_or("user"),
+    );
     let content = item
         .get("content")
         .map(|value| responses_content_to_chat_content(role, value))
@@ -213,6 +461,14 @@ fn responses_message_item_to_chat_message(item: &Value) -> Value {
         "role": role,
         "content": content
     })
+}
+
+fn normalize_responses_message_role(role: &str) -> &str {
+    match role {
+        "developer" => "system",
+        "system" | "user" | "assistant" | "tool" | "latest_reminder" => role,
+        _ => role,
+    }
 }
 
 fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
@@ -781,6 +1037,177 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_2");
         assert_eq!(messages[2]["content"], "[\"main.rs\",\"lib.rs\"]");
         assert_eq!(messages[3]["role"], "user");
+    }
+
+    #[test]
+    fn responses_request_to_chat_replays_deepseek_reasoning_with_tool_calls() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "Need the current date before calling weather."
+                    }]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Let me check."
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_date",
+                    "name": "get_date",
+                    "arguments": "{\"timezone\":\"Asia/Shanghai\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_date",
+                    "output": "2026-05-22"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "Let me check.");
+        assert_eq!(
+            messages[0]["reasoning_content"],
+            "Need the current date before calling weather."
+        );
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_date");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_date");
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_unresolved_non_deepseek_tool_turns() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "Private chain of thought."
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Tokyo\"}"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn responses_request_to_chat_normalizes_developer_role_to_system() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "You are terse."
+                    }]
+                },
+                {
+                    "type": "message",
+                    "role": "latest_reminder",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Stay on task."
+                    }]
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are terse.");
+        assert_eq!(messages[1]["role"], "latest_reminder");
+        assert_eq!(messages[1]["content"], "Stay on task.");
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_orphan_tool_call_turns() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_orphan",
+                    "name": "list_files",
+                    "arguments": "{\"path\":\"src\"}"
+                },
+                {
+                    "role": "user",
+                    "content": "Continue"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Continue");
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_assistant_text_but_strips_orphan_tool_calls() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "I checked part of it."
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_orphan",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "role": "user",
+                    "content": "Continue"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "I checked part of it.");
+        assert!(messages[0].get("tool_calls").is_none());
+        assert_eq!(messages[1]["role"], "user");
     }
 
     #[test]
