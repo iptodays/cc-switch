@@ -296,12 +296,7 @@ fn flush_pending_assistant_state(
         .get("tool_calls")
         .and_then(|value| value.as_array())
         .is_some_and(|tool_calls| !tool_calls.is_empty());
-    let has_reasoning = assistant_message
-        .get("reasoning_content")
-        .and_then(|value| value.as_str())
-        .is_some_and(|text| !text.is_empty());
-
-    if !content_is_empty || has_tool_calls || has_reasoning {
+    if !content_is_empty || has_tool_calls {
         messages.push(assistant_message);
     }
 }
@@ -434,14 +429,6 @@ fn assistant_message_has_visible_payload(message: &Value) -> bool {
             Value::Array(parts) => !parts.is_empty(),
             _ => true,
         })
-        || message
-            .get("reasoning_content")
-            .and_then(|value| value.as_str())
-            .is_some_and(|text| !text.is_empty())
-        || message
-            .get("reasoning")
-            .and_then(|value| value.as_str())
-            .is_some_and(|text| !text.is_empty())
         || message
             .get("refusal")
             .and_then(|value| value.as_str())
@@ -1208,6 +1195,60 @@ mod tests {
         assert_eq!(messages[0]["content"], "I checked part of it.");
         assert!(messages[0].get("tool_calls").is_none());
         assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_reasoning_only_assistant_messages() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "Need more context."
+                    }]
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_orphan_reasoning_only_tool_turns() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "I should inspect the repo first."
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_orphan",
+                    "name": "list_files",
+                    "arguments": "{\"path\":\"src\"}"
+                },
+                {
+                    "role": "user",
+                    "content": "Continue"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Continue");
     }
 
     #[test]
