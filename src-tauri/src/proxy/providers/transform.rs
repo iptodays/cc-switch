@@ -470,7 +470,7 @@ fn convert_message_to_openai(
                 msg["tool_calls"] = json!(tool_calls);
             }
 
-            if preserve_reasoning_content && role == "assistant" && !tool_calls.is_empty() {
+            if preserve_reasoning_content && role == "assistant" && (!tool_calls.is_empty() || !reasoning_parts.is_empty()) {
                 let reasoning_content = if reasoning_parts.is_empty() {
                     "tool call".to_string()
                 } else {

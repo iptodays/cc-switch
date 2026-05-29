@@ -1801,4 +1801,40 @@ mod tests {
         assert_eq!(msg["reasoning_content"], "I should call the tool.");
         assert!(msg.get("tool_calls").is_some());
     }
+
+    #[test]
+    fn test_transform_openai_chat_preserves_reasoning_content_for_text_only_deepseek() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/v1",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me analyze this question carefully."},
+                    {"type": "text", "text": "The answer is 42."}
+                ]
+            }]
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        let msg = &transformed["messages"][0];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "The answer is 42.");
+        assert_eq!(msg["reasoning_content"], "Let me analyze this question carefully.");
+    }
 }

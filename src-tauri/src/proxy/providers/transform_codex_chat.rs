@@ -296,7 +296,11 @@ fn flush_pending_assistant_state(
         .get("tool_calls")
         .and_then(|value| value.as_array())
         .is_some_and(|tool_calls| !tool_calls.is_empty());
-    if !content_is_empty || has_tool_calls {
+    let has_reasoning = assistant_message
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| !t.is_empty());
+    if !content_is_empty || has_tool_calls || has_reasoning {
         messages.push(assistant_message);
     }
 }
@@ -371,6 +375,15 @@ fn sanitize_orphan_tool_call_messages(messages: &mut Vec<Value>) {
                 sanitized.push(assistant);
             }
             index += 1;
+            // 跳过后续孤立的 tool 消息，避免发送无对应 tool_calls 的工具消息
+            while index < messages.len()
+                && messages[index]
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    == Some("tool")
+            {
+                index += 1;
+            }
             continue;
         }
 
@@ -431,6 +444,10 @@ fn assistant_message_has_visible_payload(message: &Value) -> bool {
         })
         || message
             .get("refusal")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.is_empty())
+        || message
+            .get("reasoning_content")
             .and_then(|value| value.as_str())
             .is_some_and(|text| !text.is_empty())
 }
@@ -1198,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_request_to_chat_drops_reasoning_only_assistant_messages() {
+    fn responses_request_to_chat_preserves_reasoning_only_assistant_messages() {
         let input = json!({
             "model": "deepseek-v4-pro",
             "input": [
@@ -1215,11 +1232,14 @@ mod tests {
         let result = responses_to_chat_completions(input).unwrap();
         let messages = result["messages"].as_array().unwrap();
 
-        assert!(messages.is_empty());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], Value::Null);
+        assert_eq!(messages[0]["reasoning_content"], "Need more context.");
     }
 
     #[test]
-    fn responses_request_to_chat_drops_orphan_reasoning_only_tool_turns() {
+    fn responses_request_to_chat_preserves_reasoning_after_orphan_tool_turns() {
         let input = json!({
             "model": "deepseek-v4-pro",
             "input": [
@@ -1246,9 +1266,13 @@ mod tests {
         let result = responses_to_chat_completions(input).unwrap();
         let messages = result["messages"].as_array().unwrap();
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "Continue");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        // assistant with reasoning should be kept (orphan tool_calls removed, reasoning preserved)
+        assert!(messages[0].get("tool_calls").is_none());
+        assert_eq!(messages[0]["reasoning_content"], "I should inspect the repo first.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Continue");
     }
 
     #[test]
